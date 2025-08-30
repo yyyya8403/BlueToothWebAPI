@@ -1,201 +1,248 @@
 <!doctype html>
 <html lang="ja">
 <head>
-  <meta charset="utf-8" />
-  <title>Web Bluetooth Demo</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <style>
-    body { font-family: system-ui, sans-serif; margin: 24px; }
-    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; margin: 6px 8px 6px 0; }
-    input { padding: 8px; width: 260px; }
-    #log { white-space: pre-wrap; background:#f7f7f7; padding:12px; border-radius:8px; min-height: 140px; }
-    .row { margin: 10px 0; }
-  </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Nearby Bluetooth Scanner (Web Bluetooth)</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; }
+  .row { margin: 10px 0; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  label { font-size: 14px; color: #333; }
+  input, button, select { padding: 8px 12px; border: 1px solid #ccc; border-radius: 10px; }
+  button{ cursor: pointer; }
+  #log { white-space: pre-wrap; background:#f7f7f7; padding:12px; border-radius:8px; min-height: 90px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+  th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; font-size: 14px; }
+  th { background: #fafafa; position: sticky; top: 0; }
+  .badge { font-size: 12px; padding: 2px 8px; border-radius: 999px; background:#eef; }
+</style>
 </head>
 <body>
-  <h1>Web Bluetooth: 探す→接続→操作</h1>
+<h1>近くのBluetooth機器を探す</h1>
 
-  <div class="row">
-    <label>Service UUID（例: 0x180F = Battery Service）</label><br/>
-    <input id="serviceUuid" value="0x180F" />
-  </div>
+<div class="row">
+  <label>名前プレフィックス:</label>
+  <input id="namePrefix" placeholder='例: "ESP", "micro:bit"' />
+  <label>Service UUID / 標準名:</label>
+  <input id="serviceUuid" placeholder='例: 0x180f / battery_service（任意）' />
+</div>
 
-  <div class="row">
-    <label>Characteristic UUID（例: 0x2A19 = Battery Level）</label><br/>
-    <input id="charUuid" value="0x2A19" />
-  </div>
+<div class="row">
+  <button id="btnStart">🔎 スキャン開始</button>
+  <button id="btnStop" disabled>🛑 停止</button>
+  <span id="mode" class="badge">準備中</span>
+</div>
 
-  <div class="row">
-    <label>名前プレフィックス（任意。例: "ESP", "BBC micro:bit" など）</label><br/>
-    <input id="namePrefix" placeholder="空なら全デバイスから選択（接続時にServiceを要求）" />
-  </div>
+<div id="log"></div>
 
-  <div class="row">
-    <button id="btnScan">🔎 探して接続</button>
-    <button id="btnDisconnect" disabled>🔌 切断</button>
-  </div>
-
-  <div class="row">
-    <button id="btnRead" disabled>📥 Read</button>
-    <button id="btnWrite" disabled>📤 Write(0x01)</button>
-    <button id="btnNotifyStart" disabled>🔔 Start Notify</button>
-    <button id="btnNotifyStop" disabled>🔕 Stop Notify</button>
-  </div>
-
-  <h3>Log</h3>
-  <div id="log"></div>
+<table>
+  <thead>
+    <tr>
+      <th>名前</th>
+      <th>デバイスID</th>
+      <th>RSSI</th>
+      <th>TxPower</th>
+      <th>Service UUIDs</th>
+      <th>最終検出</th>
+    </tr>
+  </thead>
+  <tbody id="tbody"></tbody>
+</table>
 
 <script>
 (() => {
   const $ = (id) => document.getElementById(id);
   const log = (msg) => { $('log').textContent += msg + '\n'; };
+  const modeBadge = $('mode');
+  const tbody = $('tbody');
 
-  let device = null;
-  let server = null;
-  let characteristic = null;
+  let scan = null;                  // BluetoothLEScan (requestLEScan の戻り値)
+  let scanning = false;
+  const devices = new Map();        // id -> {name, id, rssi, txPower, uuids, lastSeen}
 
-  const uiState = (connected) => {
-    $('btnDisconnect').disabled   = !connected;
-    $('btnRead').disabled         = !connected;
-    $('btnWrite').disabled        = !connected;
-    $('btnNotifyStart').disabled  = !connected;
-    $('btnNotifyStop').disabled   = !connected;
-    $('btnScan').disabled         = connected;
-  };
+  function normalizeUuid(v) {
+    const s = (v || '').trim().toLowerCase();
+    if (!s) return '';
+    if (/^0x[0-9a-f]{4}$/.test(s)) return s; // 16bit alias
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(s)) return s; // 128bit
+    // 標準名（battery_service 等）はそのまま返す（ブラウザ側が解釈）
+    return s;
+  }
 
-  async function scanAndConnect() {
-    try {
-      const serviceUuid = $('serviceUuid').value.trim();
-      const charUuid = $('charUuid').value.trim();
-      const namePrefix = $('namePrefix').value.trim();
+  function fmtTime(d) {
+    return new Date(d).toLocaleTimeString();
+  }
 
-      if (!serviceUuid) {
-        alert('Service UUID を入力してください。例: 0x180F');
-        return;
+  function render() {
+    // 新しい順（lastSeen）かつ RSSI 強い順で表示
+    const rows = Array.from(devices.values())
+      .sort((a, b) => (b.lastSeen - a.lastSeen) || (b.rssi ?? -999) - (a.rssi ?? -999))
+      .map(dev => {
+        const uuids = (dev.uuids && dev.uuids.length) ? dev.uuids.join(', ') : '';
+        return `<tr>
+          <td>${escapeHtml(dev.name || '(no name)')}</td>
+          <td>${escapeHtml(dev.id || '')}</td>
+          <td>${dev.rssi ?? ''}</td>
+          <td>${dev.txPower ?? ''}</td>
+          <td style="max-width:360px;overflow-wrap:anywhere;">${escapeHtml(uuids)}</td>
+          <td>${fmtTime(dev.lastSeen)}</td>
+        </tr>`;
+      }).join('');
+    tbody.innerHTML = rows;
+  }
+
+  function escapeHtml(s) {
+    return (s ?? '').toString()
+      .replaceAll('&','&amp;')
+      .replaceAll('<','&lt;')
+      .replaceAll('>','&gt;')
+      .replaceAll('"','&quot;')
+      .replaceAll("'",'&#39;');
+  }
+
+  function updateMode(text) {
+    modeBadge.textContent = text;
+  }
+
+  async function startScan() {
+    if (!('bluetooth' in navigator)) {
+      alert('このブラウザは Web Bluetooth に未対応です。Chrome/Edge をお試しください。');
+      return;
+    }
+
+    $('btnStart').disabled = true;
+    $('btnStop').disabled = false;
+    devices.clear(); render(); $('log').textContent = '';
+
+    const namePrefix = $('namePrefix').value.trim();
+    const service = normalizeUuid($('serviceUuid').value);
+
+    // --- A) 本命: requestLEScan が使える場合（ライブスキャン）
+    if ('requestLEScan' in navigator.bluetooth) {
+      try {
+        const options = {
+          // acceptAllAdvertisements か filters のどちらかが必要
+          acceptAllAdvertisements: !namePrefix && !service,
+          keepRepeatedDevices: true
+        };
+        const filters = [];
+        if (namePrefix) filters.push({ namePrefix });
+        if (service)    filters.push({ services: [service] });
+        if (filters.length) options.filters = filters;
+
+        log('📡 スキャン開始（requestLEScan）...');
+        scan = await navigator.bluetooth.requestLEScan(options);
+        scanning = true;
+        updateMode('スキャン中（LE Scan）');
+
+        navigator.bluetooth.addEventListener('advertisementreceived', onAdvReceived);
+      } catch (e) {
+        log('❌ requestLEScan 失敗: ' + e);
+        // B にフォールバック
+        await fallbackChooser();
       }
+      return;
+    }
+
+    // --- B) フォールバック: ユーザーに1台選んでもらい、広告受信を監視
+    await fallbackChooser();
+  }
+
+  async function fallbackChooser() {
+    try {
+      updateMode('フォールバック（Chooser）');
+      const namePrefix = $('namePrefix').value.trim();
+      const service = normalizeUuid($('serviceUuid').value);
 
       const filters = [];
       if (namePrefix) filters.push({ namePrefix });
-
-      // デバイス選択: フィルタが無い場合は acceptAllDevices: true
       const options = filters.length
-        ? { filters, optionalServices: [serviceUuid] }
-        : { acceptAllDevices: true, optionalServices: [serviceUuid] };
+        ? { filters, optionalServices: service ? [service] : [] }
+        : { acceptAllDevices: true, optionalServices: service ? [service] : [] };
 
-      log('📡 requestDevice を呼び出し中…');
-      device = await navigator.bluetooth.requestDevice(options);
+      log('📥 デバイス選択ダイアログを開きます...');
+      const device = await navigator.bluetooth.requestDevice(options);
 
-      device.addEventListener('gattserverdisconnected', onDisconnected);
+      // 一覧に1件追加
+      addOrUpdateDevice({
+        name: device.name,
+        id: device.id,
+        rssi: null,
+        txPower: null,
+        uuids: device.uuids || [],
+        lastSeen: Date.now()
+      });
+      render();
 
-      log(`✅ 選択: ${device.name || '(no name)'} [id=${device.id}]`);
-      log('🔗 接続中…');
-      server = await device.gatt.connect();
-      log('✅ 接続しました');
-
-      const service = await server.getPrimaryService(serviceUuid);
-      log(`🧩 Service(${serviceUuid}) を取得`);
-
-      characteristic = await service.getCharacteristic(charUuid);
-      log(`🧬 Characteristic(${charUuid}) を取得`);
-
-      uiState(true);
-    } catch (err) {
-      log('❌ ' + err);
-      cleanup();
+      // 可能なら広告受信を監視（対応していないデバイスもあります）
+      if ('watchAdvertisements' in device) {
+        log('👂 広告受信を待機します（watchAdvertisements）...');
+        device.addEventListener('advertisementreceived', onAdvReceived);
+        await device.watchAdvertisements();
+        scanning = true;
+      } else {
+        log('ℹ️ この環境/デバイスは watchAdvertisements に未対応のようです。');
+      }
+    } catch (e) {
+      log('❌ キャンセルまたは失敗: ' + e);
+      stopScan(true);
     }
   }
 
-  function onDisconnected() {
-    log('🔌 デバイスが切断されました');
-    cleanup();
-  }
-
-  function cleanup() {
-    characteristic = null;
-    server = null;
-    if (device && device.gatt && device.gatt.connected) {
-      try { device.gatt.disconnect(); } catch {}
-    }
-    device = null;
-    uiState(false);
-  }
-
-  async function disconnect() {
+  function onAdvReceived(ev) {
     try {
-      if (device && device.gatt.connected) device.gatt.disconnect();
+      // ev は `BluetoothAdvertisingEvent`（requestLEScan）か、device の advertisementreceived（watchAdvertisements）
+      const d = ev.device || ev.target || {};
+      const id = d.id || '(unknown)';
+      const entry = {
+        name: d.name || '(no name)',
+        id,
+        rssi: ev.rssi ?? null,
+        txPower: ev.txPower ?? null,
+        uuids: (ev.uuids && ev.uuids.length ? ev.uuids : (d.uuids || [])) || [],
+        lastSeen: Date.now()
+      };
+      addOrUpdateDevice(entry);
+      render();
+    } catch (e) {
+      log('❌ 受信処理エラー: ' + e);
+    }
+  }
+
+  function addOrUpdateDevice(info) {
+    const cur = devices.get(info.id);
+    if (!cur) {
+      devices.set(info.id, info);
+    } else {
+      Object.assign(cur, info);
+    }
+  }
+
+  function stopScan(silent = false) {
+    if (scan) {
+      try { scan.stop(); } catch {}
+      scan = null;
+    }
+    scanning = false;
+    $('btnStart').disabled = false;
+    $('btnStop').disabled = true;
+    updateMode('停止中');
+    if (!silent) log('🛑 スキャン停止');
+  }
+
+  // UI
+  $('btnStart').addEventListener('click', async () => {
+    try {
+      await startScan();
     } catch (e) {
       log('❌ ' + e);
-    } finally {
-      cleanup();
+      stopScan(true);
     }
-  }
-
-  async function readValue() {
-    if (!characteristic) return;
-    try {
-      const value = await characteristic.readValue();
-      // Battery Level(0x2A19) は 0–100 の1バイト
-      const bytes = new Uint8Array(value.buffer);
-      log('📥 Read: [' + Array.from(bytes).join(', ') + ']');
-    } catch (e) {
-      log('❌ Read失敗: ' + e);
-    }
-  }
-
-  async function writeValue() {
-    if (!characteristic) return;
-    try {
-      // デモ用: 1バイト 0x01 を書き込む
-      // ※ 多くのデバイス/特性は書き込み不可。実機仕様に合わせて変更してください。
-      const data = new Uint8Array([0x01]);
-      await characteristic.writeValue(data);
-      log('📤 Write: [0x01] 送信しました');
-    } catch (e) {
-      log('❌ Write失敗: ' + e);
-    }
-  }
-
-  async function startNotify() {
-    if (!characteristic) return;
-    try {
-      await characteristic.startNotifications();
-      characteristic.addEventListener('characteristicvaluechanged', (ev) => {
-        const v = new Uint8Array(ev.target.value.buffer);
-        log('🔔 Notify: [' + Array.from(v).join(', ') + ']');
-      });
-      log('🔔 通知購読を開始しました');
-    } catch (e) {
-      log('❌ 通知開始失敗: ' + e);
-    }
-  }
-
-  async function stopNotify() {
-    if (!characteristic) return;
-    try {
-      await characteristic.stopNotifications();
-      log('🔕 通知購読を停止しました');
-    } catch (e) {
-      log('❌ 通知停止失敗: ' + e);
-    }
-  }
-
-  // 初期UI
-  uiState(false);
-
-  // イベント
-  $('btnScan').addEventListener('click', async () => {
-    if (!('bluetooth' in navigator)) {
-      alert('このブラウザは Web Bluetooth に対応していません。Chrome/Edge をお試しください。');
-      return;
-    }
-    await scanAndConnect();
   });
+  $('btnStop').addEventListener('click', () => stopScan());
 
-  $('btnDisconnect').addEventListener('click', disconnect);
-  $('btnRead').addEventListener('click', readValue);
-  $('btnWrite').addEventListener('click', writeValue);
-  $('btnNotifyStart').addEventListener('click', startNotify);
-  $('btnNotifyStop').addEventListener('click', stopNotify);
+  // 初期表示
+  updateMode('待機中');
 })();
 </script>
 </body>
